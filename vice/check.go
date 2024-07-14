@@ -228,14 +228,16 @@ func Check(rootURL string) {
 				log.Errorf("Can't parse URL \"%s\": %s", URL, err.Error())
 			}
 			originPath := directoryParts.Path
+			directoryParts.Path, _ = filepath.Split(directoryParts.Path)
 
 			if baseURL != "" {
-				directoryParts, err = url.Parse(baseURL)
+				baseParts, err := url.Parse(baseURL)
 				if err != nil {
 					log.Errorf("Can't parse base URL \"%s\": %s", URL, err.Error())
 				}
+				directoryParts = makeAbsolute(*baseParts, *directoryParts, originPath)
+				directoryParts.Path, _ = filepath.Split(directoryParts.Path)
 			}
-			directoryParts.Path, _ = filepath.Split(directoryParts.Path)
 
 			for _, element := range doc.Find("a").Nodes {
 				if !external.Contains(URL) {
