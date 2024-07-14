@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -18,12 +19,12 @@ import (
 
 var ErrorNoAttribute = errors.New("Could not find attribute")
 
-func GetNodeAttribute(node *html.Node, name string) (string, error) {
+func GetNodeAttribute(node *html.Node, name string, URL string) (string, error) {
 	var result *string
 	for _, a := range node.Attr {
 		if strings.EqualFold(a.Key, name) {
 			if result != nil {
-				log.Printf("Multiple \"%s\" attributes", name)
+				log.Warnf("Multiple \"%s\" attributes in \"%s\"", name, URL)
 			}
 			result = &a.Val
 		}
@@ -81,33 +82,19 @@ type LinkWithReferer struct {
 	RefererURL string
 }
 
-func CompareURLWithAnchor(l URLWithAnchor, r URLWithAnchor) int {
-	if l.URL < r.URL {
-		return -1
-	} else if l.URL > r.URL {
-		return 1
-	} else if l.Anchor < r.Anchor {
-		return -1
-	} else if l.Anchor > r.Anchor {
-		return 1
-	} else {
-		return 0
-	}
-}
-
 func processLink(
 	queue *deque.Deque[LinkWithReferer],
 	external *set.Set[string],
-	requiredAnchors *set.Set[URLWithAnchor],
+	requiredAnchors *map[URLWithAnchor][]string,
 	directoryParts *url.URL,
 	rootParts *url.URL,
 	originPath string,
-	updatedURL string,
+	URL string,
 	link string,
 ) {
 	linkParts, err := url.Parse(strings.TrimSpace(link))
 	if err != nil {
-		log.Errorf("Can't parse URL \"%s\" in \"%s\": %s", link, updatedURL, err.Error())
+		log.Errorf("Can't parse URL \"%s\" in \"%s\": %s", link, URL, err.Error())
 	} else {
 		linkParts = makeAbsolute(*linkParts, *directoryParts, originPath)
 		linkParts.Path = flattenPath(linkParts.Path)
@@ -116,13 +103,18 @@ func processLink(
 		fragment, linkParts.Fragment = linkParts.Fragment, ""
 		link := linkParts.String()
 		if fragment != "" {
-			requiredAnchors.Insert(URLWithAnchor{link, fragment})
+			URLWithAnchor := URLWithAnchor{link, fragment}
+			_, ok := (*requiredAnchors)[URLWithAnchor]
+			if !ok {
+				(*requiredAnchors)[URLWithAnchor] = []string{}
+			}
+			(*requiredAnchors)[URLWithAnchor] = append((*requiredAnchors)[URLWithAnchor], URL)
 		}
 
-		if linkParts.Host != rootParts.Host || !strings.HasPrefix(linkParts.Path, rootParts.Path) || linkParts.Path != rootParts.Path && !strings.HasSuffix(rootParts.Path, "/") {
+		if linkParts.Host != rootParts.Host || !strings.HasPrefix(linkParts.Path, rootParts.Path) || linkParts.Path != rootParts.Path && !strings.HasSuffix(rootParts.Path, "/") && rootParts.Path != "" {
 			external.Insert(link)
 		}
-		queue.PushBack(LinkWithReferer{link, updatedURL})
+		queue.PushBack(LinkWithReferer{link, URL})
 	}
 }
 
@@ -135,7 +127,7 @@ func Check(rootURL string) {
 	pages := 0
 
 	availableAnchors := set.New[URLWithAnchor](10)
-	requiredAnchors := set.New[URLWithAnchor](10)
+	requiredAnchors := map[URLWithAnchor][]string{}
 
 	rootParts, err := url.Parse(rootURL)
 	if err != nil {
@@ -224,7 +216,7 @@ func Check(rootURL string) {
 					log.Errorf("More than one \"base\" tag in \"%s\"", URL)
 				}
 				if len(bases) > 0 {
-					baseURL, err = GetNodeAttribute(bases[0], "href")
+					baseURL, err = GetNodeAttribute(bases[0], "href", URL)
 					if err != nil {
 						log.Errorf("Can't get \"base\" href in \"%s\": %s", URL, err.Error())
 					}
@@ -247,15 +239,15 @@ func Check(rootURL string) {
 
 			for _, element := range doc.Find("a").Nodes {
 				if !external.Contains(URL) {
-					href, err := GetNodeAttribute(element, "href")
+					href, err := GetNodeAttribute(element, "href", URL)
 					if err != nil {
 						log.Warnf("Can't get \"a\" href in \"%s\": %s", URL, err.Error())
 					} else {
-						processLink(&queue, external, requiredAnchors, directoryParts, rootParts, originPath, updatedURL, href)
+						processLink(&queue, external, &requiredAnchors, directoryParts, rootParts, originPath, URL, href)
 					}
 				}
 
-				name, err := GetNodeAttribute(element, "name")
+				name, err := GetNodeAttribute(element, "name", URL)
 				if err == nil {
 					name = strings.TrimSpace(name)
 					availableAnchors.Insert(URLWithAnchor{URL, name})
@@ -264,17 +256,17 @@ func Check(rootURL string) {
 
 			if !external.Contains(URL) {
 				for _, element := range doc.Find("img").Nodes {
-					src, err := GetNodeAttribute(element, "src")
+					src, err := GetNodeAttribute(element, "src", URL)
 					if err != nil {
 						log.Errorf("Can't get \"img\" src in \"%s\": %s", URL, err.Error())
 					} else {
-						processLink(&queue, external, requiredAnchors, directoryParts, rootParts, originPath, updatedURL, src)
+						processLink(&queue, external, &requiredAnchors, directoryParts, rootParts, originPath, URL, src)
 					}
 				}
 			}
 
 			for _, element := range doc.Find("*").Nodes {
-				ID, err := GetNodeAttribute(element, "id")
+				ID, err := GetNodeAttribute(element, "id", URL)
 				if err == nil {
 					ID = strings.TrimSpace(ID)
 					availableAnchors.Insert(URLWithAnchor{URL, ID})
@@ -285,17 +277,18 @@ func Check(rootURL string) {
 		}
 	}
 
-	missingAnchors := set.NewTreeSet[URLWithAnchor, set.Compare[URLWithAnchor]](CompareURLWithAnchor)
-	requiredAnchors.Difference(availableAnchors).ForEach(func(URLWithAnchor URLWithAnchor) bool {
-		if !notFound.Contains(URLWithAnchor.URL) {
-			missingAnchors.Insert(URLWithAnchor)
+	missingAnchors := []URLWithAnchor{}
+	for URLWithAnchor := range requiredAnchors {
+		if !availableAnchors.Contains(URLWithAnchor) && !notFound.Contains(URLWithAnchor.URL) {
+			missingAnchors = append(missingAnchors, URLWithAnchor)
 		}
-		return true
+	}
+	sort.Slice(missingAnchors, func(i, j int) bool {
+		return missingAnchors[i].URL < missingAnchors[j].URL || missingAnchors[i].URL == missingAnchors[j].URL && missingAnchors[i].Anchor < missingAnchors[j].Anchor
 	})
-	missingAnchors.ForEach(func(URLWithAnchor URLWithAnchor) bool {
-		log.Errorf("Missing anchor \"%s#%s\"", URLWithAnchor.URL, URLWithAnchor.Anchor)
-		return true
-	})
+	for _, URLWithAnchor := range missingAnchors {
+		log.Errorf("Missing anchor \"%s#%s\" referenced from \"%s\"", URLWithAnchor.URL, URLWithAnchor.Anchor, strings.Join(requiredAnchors[URLWithAnchor], "\", \""))
+	}
 
 	log.Infof("Total pages: %d", pages)
 	log.Infof("Total links: %d", visited.Size())
