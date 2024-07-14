@@ -175,6 +175,9 @@ func Check(rootURL string) {
 				Check(updatedURL)
 				return
 			}
+			if external.Contains(URL) {
+				external.Insert(updatedURL)
+			}
 			queue.PushFront(LinkWithReferer{updatedURL, refererURL})
 			log.Debugf("\"%s\" -> \"%s\"", URL, updatedURL)
 		}
