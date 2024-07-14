@@ -119,7 +119,7 @@ func processLink(
 			requiredAnchors.Insert(URLWithAnchor{link, fragment})
 		}
 
-		if linkParts.Host != rootParts.Host || !strings.HasPrefix(linkParts.Path, rootParts.Path) || !strings.HasSuffix(rootParts.Path, "/") {
+		if linkParts.Host != rootParts.Host || !strings.HasPrefix(linkParts.Path, rootParts.Path) || linkParts.Path != rootParts.Path && !strings.HasSuffix(rootParts.Path, "/") {
 			external.Insert(link)
 		}
 		queue.PushBack(LinkWithReferer{link, updatedURL})
