@@ -65,7 +65,7 @@ func makeAbsolute(URL url.URL, directoryURL url.URL, originPath string) *url.URL
 			}
 		}
 	}
-	if !strings.HasPrefix(URL.Path, "/") {
+	if URL.Path != "" && !strings.HasPrefix(URL.Path, "/") {
 		URL.Path = directoryURL.Path + URL.Path
 	}
 	return &URL
@@ -74,6 +74,11 @@ func makeAbsolute(URL url.URL, directoryURL url.URL, originPath string) *url.URL
 type URLWithAnchor struct {
 	URL    string
 	Anchor string
+}
+
+type LinkWithReferer struct {
+	URL        string
+	RefererURL string
 }
 
 func CompareURLWithAnchor(l URLWithAnchor, r URLWithAnchor) int {
@@ -90,15 +95,19 @@ func CompareURLWithAnchor(l URLWithAnchor, r URLWithAnchor) int {
 	}
 }
 
-func processLink(queue *deque.Deque[string],
+func processLink(
+	queue *deque.Deque[LinkWithReferer],
+	external *set.Set[string],
 	requiredAnchors *set.Set[URLWithAnchor],
 	directoryParts *url.URL,
+	rootParts *url.URL,
 	originPath string,
+	updatedURL string,
 	link string,
 ) {
 	linkParts, err := url.Parse(strings.TrimSpace(link))
 	if err != nil {
-		log.Errorf("Can't parse URL \"%s\": %s", link, err.Error())
+		log.Errorf("Can't parse URL \"%s\" in \"%s\": %s", link, updatedURL, err.Error())
 	} else {
 		linkParts = makeAbsolute(*linkParts, *directoryParts, originPath)
 		linkParts.Path = flattenPath(linkParts.Path)
@@ -110,46 +119,63 @@ func processLink(queue *deque.Deque[string],
 			requiredAnchors.Insert(URLWithAnchor{link, fragment})
 		}
 
-		if linkParts.Host == directoryParts.Host && strings.HasPrefix(linkParts.Path, directoryParts.Path) {
-			queue.PushBack(link)
+		if linkParts.Host != rootParts.Host || !strings.HasPrefix(linkParts.Path, rootParts.Path) || !strings.HasSuffix(rootParts.Path, "/") {
+			external.Insert(link)
 		}
+		queue.PushBack(LinkWithReferer{link, updatedURL})
 	}
 }
 
-func Check(root string) {
+func Check(rootURL string) {
 	visited := set.New[string](10)
 	notFound := set.New[string](10)
-	queue := deque.Deque[string]{}
-	queue.PushBack(root)
+	external := set.New[string](10)
+	queue := deque.Deque[LinkWithReferer]{}
+	queue.PushBack(LinkWithReferer{rootURL, "<user request>"})
 	pages := 0
 
 	availableAnchors := set.New[URLWithAnchor](10)
 	requiredAnchors := set.New[URLWithAnchor](10)
 
+	rootParts, err := url.Parse(rootURL)
+	if err != nil {
+		log.Errorf("Can't parse root URL \"%s\": %s", rootURL, err.Error())
+		return
+	}
+
 	for queue.Len() > 0 {
-		URL, _ := queue.RemoveFront()
+		linkWithReferer, _ := queue.RemoveFront()
+		URL := linkWithReferer.URL
 		if visited.Contains(URL) {
 			continue
 		}
 		visited.Insert(URL)
+		refererURL := linkWithReferer.RefererURL
 
 		log.Debugf("Scanning \"%s\"", URL)
 		response, err := http.Head(URL)
 		if err != nil {
 			notFound.Insert(URL)
-			log.Errorf("Can't get \"%s\": %s", URL, err.Error())
+			log.Errorf("Can't get \"%s\" referenced from \"%s\": %s", URL, refererURL, err.Error())
 			continue
 		}
 		if response.StatusCode != http.StatusOK {
 			io.Copy(io.Discard, response.Body)
 			response.Body.Close()
 			notFound.Insert(URL)
-			log.Errorf("Can't get \"%s\": %s", URL, response.Status)
+			log.Errorf("Can't get \"%s\" referenced from \"%s\": %s", URL, refererURL, response.Status)
 			continue
 		}
 
 		updatedURL := response.Request.URL.String()
 		if URL != updatedURL {
+			if URL == rootURL {
+				io.Copy(io.Discard, response.Body)
+				response.Body.Close()
+				Check(updatedURL)
+				return
+			}
+			queue.PushFront(LinkWithReferer{updatedURL, refererURL})
 			log.Debugf("\"%s\" -> \"%s\"", URL, updatedURL)
 		}
 
@@ -170,14 +196,14 @@ func Check(root string) {
 		response, err = http.Get(updatedURL)
 		if err != nil {
 			notFound.Insert(URL)
-			log.Errorf("Can't get \"%s\": %s", URL, err.Error())
+			log.Errorf("Can't get \"%s\" referenced from \"%s\": %s", URL, refererURL, err.Error())
 			continue
 		}
 		if response.StatusCode != http.StatusOK {
 			io.Copy(io.Discard, response.Body)
 			response.Body.Close()
 			notFound.Insert(URL)
-			log.Errorf("Can't get \"%s\": %s", URL, response.Status)
+			log.Errorf("Can't get \"%s\" referenced from \"%s\": %s", URL, refererURL, response.Status)
 			continue
 		}
 
@@ -189,14 +215,16 @@ func Check(root string) {
 			log.Errorf("Can't parse \"%s\": %s", URL, err.Error())
 		} else {
 			var baseURL string
-			bases := doc.Find("base").Nodes
-			if len(bases) > 1 {
-				log.Errorf("More than one \"base\" tag in \"%s\"", URL)
-			}
-			if len(bases) > 0 {
-				baseURL, err = GetNodeAttribute(bases[0], "href")
-				if err != nil {
-					log.Errorf("Can't get \"base\" href in \"%s\": %s", URL, err.Error())
+			if !external.Contains(URL) {
+				bases := doc.Find("base").Nodes
+				if len(bases) > 1 {
+					log.Errorf("More than one \"base\" tag in \"%s\"", URL)
+				}
+				if len(bases) > 0 {
+					baseURL, err = GetNodeAttribute(bases[0], "href")
+					if err != nil {
+						log.Errorf("Can't get \"base\" href in \"%s\": %s", URL, err.Error())
+					}
 				}
 			}
 
@@ -215,26 +243,30 @@ func Check(root string) {
 			directoryParts.Path, _ = filepath.Split(directoryParts.Path)
 
 			for _, element := range doc.Find("a").Nodes {
-				href, err := GetNodeAttribute(element, "href")
-				if err != nil {
-					log.Errorf("Can't get \"a\" href in \"%s\": %s", URL, err.Error())
-				} else {
-					processLink(&queue, requiredAnchors, directoryParts, originPath, href)
+				if !external.Contains(URL) {
+					href, err := GetNodeAttribute(element, "href")
+					if err != nil {
+						log.Warnf("Can't get \"a\" href in \"%s\": %s", URL, err.Error())
+					} else {
+						processLink(&queue, external, requiredAnchors, directoryParts, rootParts, originPath, updatedURL, href)
+					}
 				}
 
 				name, err := GetNodeAttribute(element, "name")
 				if err == nil {
 					name = strings.TrimSpace(name)
-					availableAnchors.Insert(URLWithAnchor{updatedURL, name})
+					availableAnchors.Insert(URLWithAnchor{URL, name})
 				}
 			}
 
-			for _, element := range doc.Find("img").Nodes {
-				src, err := GetNodeAttribute(element, "src")
-				if err != nil {
-					log.Errorf("Can't get \"img\" src in \"%s\": %s", URL, err.Error())
-				} else {
-					processLink(&queue, requiredAnchors, directoryParts, originPath, src)
+			if !external.Contains(URL) {
+				for _, element := range doc.Find("img").Nodes {
+					src, err := GetNodeAttribute(element, "src")
+					if err != nil {
+						log.Errorf("Can't get \"img\" src in \"%s\": %s", URL, err.Error())
+					} else {
+						processLink(&queue, external, requiredAnchors, directoryParts, rootParts, originPath, updatedURL, src)
+					}
 				}
 			}
 
@@ -242,7 +274,7 @@ func Check(root string) {
 				ID, err := GetNodeAttribute(element, "id")
 				if err == nil {
 					ID = strings.TrimSpace(ID)
-					availableAnchors.Insert(URLWithAnchor{updatedURL, ID})
+					availableAnchors.Insert(URLWithAnchor{URL, ID})
 				}
 			}
 
