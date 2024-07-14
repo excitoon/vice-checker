@@ -46,7 +46,7 @@ func flattenPath(path string) string {
 			if len(newPathParts) > 0 {
 				newPathParts = newPathParts[:len(newPathParts)-1]
 			}
-		} else {
+		} else if part != "." {
 			newPathParts = append(newPathParts, part)
 		}
 	}
